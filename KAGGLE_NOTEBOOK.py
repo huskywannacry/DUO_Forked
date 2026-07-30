@@ -1,19 +1,29 @@
-# DUO-Anchor: End-to-end Kaggle notebook (clone -> train -> attack)
+# DUO-Anchor v2: End-to-end Kaggle notebook với Multi-Concept Anchor Auto-Discovery
 #
-# Mục tiêu: chạy TOÀN BỘ pipeline trong 1 notebook
-#   1. Clone repo
-#   2. Cài deps
-#   3. Prepare data + anchor images
-#   4. Train DUO baseline (5 LoRA)
-#   5. Train DUO_Anchor (5 LoRA)
-#   6. White-box Concept Inversion attack trên CẢ 2 model -> bảng DSR so sánh
+# CẢI TIẾN SO VỚI DUO GỐC:
+#   Thay vì hand-curate 8 anchor prompts/concept, dùng CLIP tự động:
+#     1. discover_anchors.py — tìm top-20 prompts gần target unsafe trong CLIP text space
+#     2. generate_anchors_enhanced.py — sinh ảnh + CLIP image-sim filter + NudeNet filter
+#     3. select_hard_anchors — chọn 24 ảnh/concept có similarity 0.4-0.9 (hard anchors)
+#   => Giúp L_retain giữ đúng "tương cà" mà xóa "máu me" (selectivity)
+#
+# Pipeline gồm:
+#   1. Clone repo + cài deps
+#   2. Prepare data + ENHANCED anchor images (auto-discover, CLIP-filtered)
+#   3. Train DUO baseline (5 LoRA, dùng config.json gốc)
+#   4. Train DUO_Anchor (5 LoRA, dùng config_auto_anchor.json mới)
+#   5. Concept Inversion attack (2 sources × 5 LoRAs) -> bảng DSR
+#   6. Ring-A-Bell attack (GA-based) -> bảng DSR
+#   7. So sánh LPIPS anchor retention giữa baseline vs enhanced
 #
 # Walltime ước tính (Kaggle P100, 1 GPU):
-#   Setup + data + anchor     ~25 min
-#   Train DUO baseline         ~75 min  (nudity 25 + 4 violence 50)
-#   Train DUO_Anchor           ~98 min  (nudity 33 + 4 violence 65)
-#   Attack (2 sources x 5 LoRAs) ~2.5 h
-#   TOTAL                      ~6.5 h  (vừa với 12 h background session)
+#   Setup + data               ~20 min
+#   Enhanced anchor discovery  ~15 min (CLIP + SD gen + filter)
+#   Train DUO baseline         ~75 min
+#   Train DUO_Anchor           ~98 min
+#   Concept Inversion attack   ~2.5 h
+#   Ring-A-Bell attack         ~50 min
+#   TOTAL                      ~6.8 h  (vừa với 12 h background session)
 #
 # KAGGLE SETTINGS
 #   * Accelerator:  GPU P100 (hoặc T4 x2)
@@ -63,18 +73,18 @@ except Exception as e:
 
 
 # ============================================================
-# CELL 3: PREPARE DATA + ANCHOR IMAGES (~25 phút, lần đầu)
+# CELL 3a: PREPARE DATA + BASIC ANCHOR IMAGES (~25 phút)
 # ============================================================
-# Generate paired unsafe/safe datasets bằng SDEdit
+# Generate paired unsafe/safe datasets bằng SDEdit (vẫn dùng config.json gốc)
 !bash scripts/prepare-dataset.sh
 
-# Generate anchor images cho mỗi concept
+# Generate basic anchor images (config.json hand-curated anchors, fallback)
 !bash scripts/prepare-anchor.sh
 
-# Verify
+# Verify basic anchors
 !echo "=== datasets/SD ==="
 !ls datasets/SD/
-!echo "=== anchor images per concept ==="
+!echo "=== basic anchor images per concept ==="
 import subprocess
 for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
     result = subprocess.run(
@@ -82,7 +92,78 @@ for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
         shell=True, capture_output=True, text=True
     )
     count = result.stdout.strip()
-    print(f"  {c:<8s}  {count if count else '0'} anchor images")
+    print(f"  {c:<8s}  {count if count else '0'} basic anchor images")
+
+
+# ============================================================
+# CELL 3b (~15 min, ~3 GB VRAM): ENHANCED ANCHOR AUTO-DISCOVERY
+# ============================================================
+# Bước này chạy 2 script:
+#   1. discover_anchors.py — dùng CLIP tìm top-20 anchor prompts/concept
+#      (không cần GPU vì built-in word pool)
+#   2. generate_anchors_enhanced.py — sinh ảnh + CLIP similarity filter
+#      + NudeNet safety filter -> chọn hard anchors
+#
+# Output: config_auto_anchor.json (dùng cho training DUO_Anchor)
+#         datasets/SD/<concept>/anchor/ (đã filter, ~24 ảnh/concept)
+
+print("=" * 60)
+print("ENHANCED ANCHOR: Step 1 — Auto-discover prompts (CLIP text space)")
+print("=" * 60)
+!python3 datasets/SD/discover_anchors.py \
+    --config       datasets/SD/config.json \
+    --output       datasets/SD/config_auto_anchor.json \
+    --top_k        20 \
+    --sim_min      0.55 \
+    --sim_max      0.88 \
+    --device       "cuda:0" 2>&1
+
+print("")
+print("=" * 60)
+print("ENHANCED ANCHOR: Step 2 — Generate + filter images (CLIP + NudeNet)")
+print("=" * 60)
+!python3 datasets/SD/generate_anchors_enhanced.py \
+    --config                    datasets/SD/config_auto_anchor.json \
+    --data_dir                  datasets/SD \
+    --device                    "cuda:0" \
+    --per_prompt                6 \
+    --max_anchors               24 \
+    --sim_min                   0.40 \
+    --sim_max                   0.90 \
+    --diversity_threshold       0.97 \
+    --nudenet_filter 2>&1
+
+# Verify enhanced anchors
+!echo "=== enhanced anchor images per concept ==="
+for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
+    result = subprocess.run(
+        f"ls datasets/SD/{c}/anchor/ 2>/dev/null | grep -c '\\.jpg'",
+        shell=True, capture_output=True, text=True
+    )
+    count = result.stdout.strip()
+    print(f"  {c:<8s}  {count if count else '0'} enhanced anchor images")
+
+!echo "=== config_auto_anchor.json anchor prompts ==="
+import subprocess
+result = subprocess.run(
+    ["python3", "-c", """
+import json
+with open('datasets/SD/config_auto_anchor.json') as f:
+    cfg = json.load(f)
+for c in cfg:
+    if 'anchor_prompts' in cfg[c]:
+        prompts = cfg[c]['anchor_prompts']
+        print(f'{c:<10s}: {len(prompts)} prompts')
+        for p in prompts[:5]:
+            print(f'           - {p}')
+        if len(prompts) > 5:
+            print(f'           ... and {len(prompts)-5} more')
+"""],
+    capture_output=True, text=True
+)
+print(result.stdout)
+if result.returncode != 0:
+    print("STDERR:", result.stderr)
 
 
 # ============================================================
@@ -96,10 +177,27 @@ for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
 
 
 # ============================================================
-# CELL 5: TRAIN DUO + ANCHOR (~98 phút)
+# CELL 5: TRAIN DUO + ANCHOR (~98 phút, dùng ENHANCED anchors)
 # ============================================================
-!bash scripts/sd-nudity-anchor.sh
-!bash scripts/sd-violence-anchor.sh
+# Lưu ý: script anchor dùng config_auto_anchor.json (có nhiều anchor hơn,
+# đã filter bằng CLIP + NudeNet) thay vì config.json gốc.
+#
+# Nếu script sd-nudity-anchor.sh / sd-violence-anchor.sh mặc định dùng
+# config.json, hãy sửa chúng thành config_auto_anchor.json trước khi chạy.
+
+import subprocess
+
+# Tạo bản sao script anchor dùng config_auto_anchor.json
+subprocess.run("cp scripts/sd-nudity-anchor.sh scripts/sd-nudity-anchor-enhanced.sh", shell=True, check=True)
+subprocess.run("cp scripts/sd-violence-anchor.sh scripts/sd-violence-anchor-enhanced.sh", shell=True, check=True)
+
+# Sửa config_dir trong script copy
+subprocess.run("sed -i 's|config\\.json|config_auto_anchor.json|g' scripts/sd-nudity-anchor-enhanced.sh", shell=True, check=True)
+subprocess.run("sed -i 's|config\\.json|config_auto_anchor.json|g' scripts/sd-violence-anchor-enhanced.sh", shell=True, check=True)
+
+# Train
+subprocess.run("bash scripts/sd-nudity-anchor-enhanced.sh", shell=True, check=True)
+subprocess.run("bash scripts/sd-violence-anchor-enhanced.sh", shell=True, check=True)
 
 
 # ============================================================
