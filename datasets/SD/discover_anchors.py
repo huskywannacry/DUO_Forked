@@ -366,6 +366,9 @@ def embed_texts(texts, model, proc, device):
     inputs = proc(text=texts, return_tensors="pt", padding=True,
                   truncation=True, max_length=77).to(device)
     outputs = model.get_text_features(**inputs)
+    # transformers >= 4.48 may wrap tensor in BaseModelOutputWithPooling
+    if hasattr(outputs, "pooler_output"):
+        outputs = outputs.pooler_output
     return F.normalize(outputs, p=2, dim=-1)
 
 
