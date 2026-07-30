@@ -1,0 +1,14 @@
+outputs/
+wandb/
+__pycache__/
+*.pyc
+.DS_Store
+datasets/i2p/
+paper.txt
+Blood/
+Gun/
+Horror/
+Nudity/
+Suffer/
+*.sw*
+*.pdf
