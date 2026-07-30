@@ -49,6 +49,7 @@ if not os.path.exists("/kaggle/working/DUO-Anchor"):
 
 !pip install -q -r requirements.txt
 !pip install -q --upgrade peft diffusers transformers accelerate
+!pip install -q 'peft<0.15.0'  # pin PEFT tránh lỗi torchao dispatcher
 !pip install -q git+https://github.com/notAI-tech/NudeNet.git
 
 import torch

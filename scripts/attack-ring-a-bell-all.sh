@@ -24,6 +24,7 @@ python eval_attack_ring_a_bell.py \
     --num_attack_prompts 50 \
     --ga_population 100 \
     --ga_generations 50 \
+    --config_dir  "$base_dir/datasets/SD/config.json" \
     --output_dir "$base_dir/eval/outputs/ring_a_bell"
 
 # ---- Violence sub-LoRAs (beta=1000) ----
@@ -37,4 +38,5 @@ python eval_attack_ring_a_bell.py \
     --num_attack_prompts 50 \
     --ga_population 100 \
     --ga_generations 50 \
+    --config_dir  "$base_dir/datasets/SD/config.json" \
     --output_dir "$base_dir/eval/outputs/ring_a_bell"
