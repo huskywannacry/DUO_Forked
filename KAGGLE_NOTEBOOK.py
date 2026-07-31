@@ -365,7 +365,132 @@ for log in sorted(rab_root.rglob("dsr_log.csv")):
 
 
 # ============================================================
-# CELL 12: PACK RESULTS FOR DOWNLOAD
+# CELL 12 (~5 min): DSR BASELINE (eval_i2p.py — không attack)
+# ============================================================
+# Đo DSR gốc trên i2p prompts — model đã unlearn concept chưa?
+# Chạy riêng cho DUO baseline và DUO_Anchor.
+print("=" * 60)
+print("DSR BASELINE: DUO baseline")
+print("=" * 60)
+import subprocess, pathlib
+
+def run_i2p(model_root, label, output_dir, mode):
+    """Run eval_i2p.py for a single mode, return path to results."""
+    out_sub = os.path.join(output_dir, f"{label}_{mode}")
+    subprocess.run(
+        f"python3 eval/eval_i2p.py --model_root {model_root} "
+        f"--mode {mode} --num_prompts 50 "
+        f"--output_dir {out_sub} 2>&1 | tail -15",
+        shell=True
+    )
+    return out_sub
+
+# Nudity (beta=500)
+out_base = "eval/outputs/dsr_baseline"
+os.makedirs(out_base, exist_ok=True)
+run_i2p("outputs/unlearn/SD-train/dpo/500", "duo_nudity", out_base, "nudity")
+run_i2p("outputs/unlearn/SD-train/duo-anchor/500", "anchor_nudity", out_base, "nudity")
+
+# Violence (beta=1000)
+out_viol = "eval/outputs/dsr_baseline_violence"
+os.makedirs(out_viol, exist_ok=True)
+run_i2p("outputs/unlearn/SD-train/dpo/1000", "duo_violence", out_viol, "violence")
+run_i2p("outputs/unlearn/SD-train/duo-anchor/1000", "anchor_violence", out_viol, "violence")
+
+# Aggregate DSR for table
+print("\n=== DSR Baseline Summary ===")
+nudity_duo = None
+nudity_anchor = None
+violence_duo = None
+violence_anchor = None
+
+# Try to parse from output jsons
+for json_path in sorted(pathlib.Path("eval/outputs").rglob("dsr_baseline*/dsr_results.json")):
+    with open(json_path) as f:
+        data = json.load(f)
+    print(f"  {json_path.parent.name}:")
+    for k, v in data.items():
+        print(f"    {k}: DSR={v.get('dsr', 'N/A'):.4f}")
+
+print("DSR baseline done!")
+
+
+# ============================================================
+# CELL 13 (~10 min): LPIPS ANCHOR RETENTION
+# ============================================================
+# Đo LPIPS giữa ảnh anchor từ:
+#   - SD 1.4 gốc (reference)
+#   - DUO baseline (đã unlearn, không anchor loss)
+#   - DUO_Anchor (đã unlearn + L_retain)
+# LPIPS thấp hơn = anchor được giữ tốt hơn.
+
+print("=" * 60)
+print("LPIPS EVALUATION: Anchor Retention")
+print("=" * 60)
+!python3 eval/eval_lpips.py \
+    --lora_root outputs/unlearn/SD-train \
+    --output eval/outputs/lpips/lpips_results.json \
+    --duo_beta 500 \
+    --anchor_beta 500 \
+    --concepts "Nudity,Blood,Gun,Horror,Suffer" \
+    --per_prompt 4 \
+    --device "cuda:0" 2>&1
+
+# Show results
+import json
+lpips_path = pathlib.Path("eval/outputs/lpips/lpips_results.json")
+if lpips_path.exists():
+    print("\n=== LPIPS Results ===")
+    print(f"{'Concept':<12s}  {'DUO':>8s}  {'DUO_Anchor':>12s}  {'delta':>8s}")
+    print("-" * 48)
+    with open(lpips_path) as f:
+        data = json.load(f)
+    for concept in ("Nudity", "Blood", "Gun", "Horror", "Suffer"):
+        if concept in data:
+            d = data[concept]
+            print(f"{concept:<12s}  {d['lpips_duo']:>8.4f}  {d['lpips_duo_anchor']:>12.4f}  {d['delta']:>+8.4f}")
+
+
+# ============================================================
+# CELL 14 (~10 min): FID + CLIP SCORE
+# ============================================================
+# Đo FID và CLIP score trên 300 prompt generic (COCO proxy)
+# So sánh SD1.4 gốc vs DUO baseline vs DUO_Anchor.
+# Lưu ý: đây là COCO proxy, không phải MS COCO 30k chính thức.
+
+print("=" * 60)
+print("FID + CLIP SCORE EVALUATION")
+print("=" * 60)
+
+os.makedirs("eval/outputs/fid_clip", exist_ok=True)
+
+# DUO baseline
+print("\n--- DUO baseline ---")
+!python3 eval/eval_fid_clip.py \
+    --model_root outputs/unlearn/SD-train/dpo/500 \
+    --output eval/outputs/fid_clip/fid_clip_duo.json \
+    --num_prompts 300 \
+    --device "cuda:0" 2>&1
+
+# DUO_Anchor
+print("\n--- DUO_Anchor ---")
+!python3 eval/eval_fid_clip.py \
+    --model_root outputs/unlearn/SD-train/duo-anchor/500 \
+    --output eval/outputs/fid_clip/fid_clip_anchor.json \
+    --num_prompts 300 \
+    --device "cuda:0" 2>&1
+
+# Aggregate
+print("\n=== FID + CLIP Score Summary ===")
+for json_path in sorted(pathlib.Path("eval/outputs/fid_clip").rglob("fid_clip_*.json")):
+    with open(json_path) as f:
+        data = json.load(f)
+    label = json_path.stem.replace("fid_clip_", "")
+    print(f"  {label:<20s}  CLIP={data.get('clip_score_unlearn', 'N/A'):>8.4f}  FID={data.get('fid', 'N/A')}")
+
+
+# ============================================================
+# CELL 15: PACK RESULTS FOR DOWNLOAD
 # ============================================================
 !cd /kaggle/working && tar -czf DUO-Anchor-results.tar.gz \
     DUO-Anchor/eval/outputs/ 2>/dev/null

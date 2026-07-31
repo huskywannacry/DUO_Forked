@@ -12,3 +12,6 @@ Nudity/
 Suffer/
 *.sw*
 *.pdf
+/DUO-Anchor-datasets
+/DUO-Anchor-results
+*.gz

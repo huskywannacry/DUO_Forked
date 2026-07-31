@@ -4,6 +4,11 @@
 #   - DUO baseline (no anchor loss)
 #   - DUO + anchor loss (ours)
 # Lower LPIPS vs reference = better preservation of the safe concept.
+#
+# Usage:
+#   python eval/eval_lpips.py \
+#       --lora_root train/outputs/unlearn/SD-train \
+#       --output eval/outputs/lpips/lpips_results.json
 import argparse
 import json
 import os
@@ -23,32 +28,36 @@ def parse_args():
     p.add_argument("--data_dir", type=str, default="datasets/SD")
     p.add_argument(
         "--lora_root", type=str, required=True,
-        help="Root dir with Blood/Gun/Horror/Suffer sub-folders of LoRA weights",
+        help="Root dir with dpo/<beta>/{concept} and duo-anchor/<beta>/{concept}",
     )
-    p.add_argument("--concepts", type=str, default="Blood,Gun,Horror,Suffer")
+    p.add_argument("--output", type=str, default=None,
+                    help="Output JSON path")
+    p.add_argument("--duo_beta", type=str, default="500",
+                    help="Beta for DUO baseline")
+    p.add_argument("--anchor_beta", type=str, default="500",
+                    help="Beta for DUO_Anchor")
+    p.add_argument("--concepts", type=str, default="Nudity,Blood,Gun,Horror,Suffer")
     p.add_argument("--per_prompt", type=int, default=4)
     p.add_argument("--device", type=str, default="cuda")
     return p.parse_args()
 
 
-def load_pipeline(pretrained, lora_path, adapter_name=None, weight=1.0, device="cuda"):
+def load_pipeline(pretrained, lora_path=None, device="cuda"):
     pipe = StableDiffusionPipeline.from_pretrained(
         pretrained, torch_dtype=torch.float16
     ).to(device)
     pipe.safety_checker = None
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe.set_progress_bar_config(disable=True)
-    if lora_path is not None:
+    if lora_path is not None and os.path.exists(lora_path):
         if os.path.isdir(lora_path):
-            pipe.load_lora_weights(lora_path, adapter_name=adapter_name or "default")
+            pipe.load_lora_weights(lora_path)
         else:
             pipe.load_lora_weights(
                 os.path.dirname(lora_path),
                 weight_name=os.path.basename(lora_path),
-                adapter_name=adapter_name or "default",
             )
-        if adapter_name is not None:
-            pipe.set_adapters([adapter_name], adapter_weights=[weight])
+        pipe.fuse_lora()
     return pipe
 
 
@@ -56,7 +65,8 @@ def generate(pipe, prompts, seed=42, num_per_prompt=1):
     g = torch.Generator("cuda").manual_seed(seed)
     out = []
     for p in prompts:
-        out.append(pipe(p, num_images_per_prompt=num_per_prompt, generator=g).images[0])
+        out.append(pipe(p, num_images_per_prompt=num_per_prompt,
+                        generator=g).images[0])
     return out
 
 
@@ -94,7 +104,10 @@ def main():
 
     for concept in concepts:
         anchor_prompts = cfg[concept].get("anchor_prompts", [])
-        # repeat each prompt `per_prompt` times to match generation strategy
+        if not anchor_prompts:
+            print(f"\n[{concept}] no anchor prompts, skipping.")
+            continue
+        # repeat each prompt `per_prompt` times
         prompts = []
         for ap in anchor_prompts:
             prompts.extend([ap] * args.per_prompt)
@@ -103,55 +116,63 @@ def main():
 
         # 1) reference images (no LoRA)
         print("  - reference (no LoRA)")
-        pipe_ref = load_pipeline(
-            "CompVis/stable-diffusion-v1-4", None, device=device
-        )
+        pipe_ref = load_pipeline("CompVis/stable-diffusion-v1-4", None, device)
         ref_imgs = generate(pipe_ref, prompts)
         del pipe_ref
         torch.cuda.empty_cache()
 
-        # 2) baseline DUO (single LoRA at concept)
-        print("  - DUO baseline")
+        # 2) DUO baseline
         baseline_lora = os.path.join(
-            args.lora_root, "baseline", concept, "pytorch_lora_weights.safetensors"
+            args.lora_root, "dpo", args.duo_beta, concept,
+            "pytorch_lora_weights.safetensors"
         )
         if not os.path.exists(baseline_lora):
-            print(f"    skip: {baseline_lora} not found")
-            continue
-        pipe_b = load_pipeline(
-            "CompVis/stable-diffusion-v1-4", baseline_lora, device=device
-        )
-        base_imgs = generate(pipe_b, prompts)
-        del pipe_b
-        torch.cuda.empty_cache()
+            print(f"    skip DUO baseline: {baseline_lora} not found")
+            base_imgs = ref_imgs  # fallback
+        else:
+            print("  - DUO baseline")
+            pipe_b = load_pipeline("CompVis/stable-diffusion-v1-4", baseline_lora, device)
+            base_imgs = generate(pipe_b, prompts)
+            del pipe_b
+            torch.cuda.empty_cache()
 
-        # 3) ours (DUO + anchor)
-        print("  - DUO + anchor")
-        ours_lora = os.path.join(
-            args.lora_root, "anchor", concept, "pytorch_lora_weights.safetensors"
+        # 3) DUO_Anchor
+        anchor_lora = os.path.join(
+            args.lora_root, "duo-anchor", args.anchor_beta, concept,
+            "pytorch_lora_weights.safetensors"
         )
-        pipe_o = load_pipeline(
-            "CompVis/stable-diffusion-v1-4", ours_lora, device=device
-        )
-        ours_imgs = generate(pipe_o, prompts)
-        del pipe_o
-        torch.cuda.empty_cache()
+        if not os.path.exists(anchor_lora):
+            print(f"    skip DUO_Anchor: {anchor_lora} not found")
+            anchor_imgs = ref_imgs
+        else:
+            print("  - DUO_Anchor")
+            pipe_o = load_pipeline("CompVis/stable-diffusion-v1-4", anchor_lora, device)
+            anchor_imgs = generate(pipe_o, prompts)
+            del pipe_o
+            torch.cuda.empty_cache()
 
         # LPIPS
         lp_base = compute_lpips(lpips_fn, ref_imgs, base_imgs, device)
-        lp_ours = compute_lpips(lpips_fn, ref_imgs, ours_imgs, device)
-        print(f"  LPIPS baseline : {lp_base:.4f}")
-        print(f"  LPIPS + anchor : {lp_ours:.4f}  (delta = {lp_ours - lp_base:+.4f})")
+        lp_ours = compute_lpips(lpips_fn, ref_imgs, anchor_imgs, device)
+        print(f"  LPIPS DUO (baseline) : {lp_base:.4f}")
+        print(f"  LPIPS DUO_Anchor     : {lp_ours:.4f}  (delta = {lp_ours - lp_base:+.4f})")
         all_results[concept] = {
-            "lpips_baseline": lp_base,
-            "lpips_anchor": lp_ours,
-            "delta": lp_ours - lp_base,
+            "lpips_duo": round(lp_base, 4),
+            "lpips_duo_anchor": round(lp_ours, 4),
+            "delta": round(lp_ours - lp_base, 4),
         }
 
-    out_json = os.path.join(args.lora_root, "lpips_results.json")
-    with open(out_json, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print("\nResults saved to", out_json)
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\nResults saved to {args.output}")
+    else:
+        out_default = os.path.join(args.lora_root, "lpips_results.json")
+        with open(out_default, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\nResults saved to {out_default}")
+
     print(json.dumps(all_results, indent=2))
 
 

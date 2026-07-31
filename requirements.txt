@@ -11,3 +11,6 @@ diffusers
 tqdm
 git+https://github.com/notAI-tech/NudeNet.git
 safetensors
+torchmetrics
+torchvision
+pytorch-fid
