@@ -1,36 +1,31 @@
-# DUO-Anchor v2: End-to-end Kaggle notebook với Multi-Concept Anchor Auto-Discovery
-#
-# CẢI TIẾN SO VỚI DUO GỐC:
-#   Thay vì hand-curate 8 anchor prompts/concept, dùng CLIP tự động:
-#     1. discover_anchors.py — tìm top-20 prompts gần target unsafe trong CLIP text space
-#     2. generate_anchors_enhanced.py — sinh ảnh + CLIP image-sim filter + NudeNet filter
-#     3. select_hard_anchors — chọn 24 ảnh/concept có similarity 0.4-0.9 (hard anchors)
-#   => Giúp L_retain giữ đúng "tương cà" mà xóa "máu me" (selectivity)
+# DUO-Anchor v3: End-to-end Kaggle notebook với Paper-grade Evaluation
 #
 # Pipeline gồm:
 #   1. Clone repo + cài deps
-#   2. Prepare data + ENHANCED anchor images (auto-discover, CLIP-filtered)
-#   3. Train DUO baseline (5 LoRA, dùng config.json gốc)
-#   4. Train DUO_Anchor (5 LoRA, dùng config_auto_anchor.json mới)
-#   5. Concept Inversion attack (2 sources × 5 LoRAs) -> bảng DSR
-#   6. Ring-A-Bell attack (GA-based) -> bảng DSR
-#   7. So sánh LPIPS anchor retention giữa baseline vs enhanced
+#   2. Dataset + Enhanced anchors
+#   3. Train DUO baseline + DUO_Anchor (10 LoRAs)
+#   4. Concept Inversion attack  → DSR bảng
+#   5. Ring-A-Bell attack        → DSR bảng
+#   6. FID + CLIP on MS COCO 10k → (MỚI: paper Sec 4.1 — COCO thật)
+#   7. LPIPS Anchor Retention
+#   8. Pack + zip kết quả
 #
 # Walltime ước tính (Kaggle P100, 1 GPU):
-#   Setup + data               ~20 min
-#   Enhanced anchor discovery  ~15 min (CLIP + SD gen + filter)
-#   Train DUO baseline         ~75 min
-#   Train DUO_Anchor           ~98 min
-#   Concept Inversion attack   ~2.5 h
-#   Ring-A-Bell attack         ~50 min
-#   TOTAL                      ~6.8 h  (vừa với 12 h background session)
+#   Setup + data                ~20 min
+#   Enhanced anchor discovery   ~15 min
+#   Train DUO baseline          ~75 min
+#   Train DUO_Anchor            ~98 min
+#   Concept Inversion attack    ~2.5 h
+#   Ring-A-Bell attack          ~50 min
+#   FID/CLIP COCO 10k           ~3 h     (MỚI: paper Sec 4.1)
+#   LPIPS + misc                ~15 min
+#   TOTAL                       ~9 h     (fit 12h background)
 #
 # KAGGLE SETTINGS
 #   * Accelerator:  GPU P100 (hoặc T4 x2)
-#   * Internet:     ON
+#   * Internet:     ON (cần tải COCO + HuggingFace datasets)
 #   * Background:   ON (Save Version -> Run All -> "Save as background")
-#   * Optional:     Add-ons > Secrets > add OPENAI_API_KEY (cho GPT-4o judge
-#                   của violence; nếu thiếu sẽ fallback sang CLIP proxy local)
+#   * Optional:     Add-ons > Secrets > add OPENAI_API_KEY
 
 # ============================================================
 # CELL 1: CLONE REPO + INSTALL
@@ -47,10 +42,16 @@ if not os.path.exists("/kaggle/working/DUO-Anchor"):
     !git clone -b {BRANCH} {REPO} /kaggle/working/DUO-Anchor
 %cd /kaggle/working/DUO-Anchor
 
+# Patch model_root path trong attack scripts
+!sed -i 's|save_dir="./outputs"|save_dir="./train/outputs"|g' \
+    scripts/attack-both-all.sh scripts/attack-ring-a-bell-all.sh
+
 !pip install -q -r requirements.txt
-# Pin known-good versions compatible with Kaggle's torchao 0.10.0
 !pip install -q 'diffusers<=0.29.0' 'peft<=0.12.0' 'transformers<=4.44.0' 'accelerate<=1.0.0'
 !pip install -q git+https://github.com/notAI-tech/NudeNet.git
+
+# Cài thêm datasets + torchmetrics cho COCO 30k FID/CLIP
+!pip install -q datasets torchmetrics pytorch-fid
 
 import torch
 print(f"PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}, "
@@ -58,7 +59,7 @@ print(f"PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}, "
 
 
 # ============================================================
-# CELL 2: OPTIONAL - load OPENAI_API_KEY từ Kaggle Secrets
+# CELL 2: load OPENAI_API_KEY
 # ============================================================
 try:
     from kaggle_secrets import UserSecretsClient
@@ -74,32 +75,24 @@ except Exception as e:
 
 
 # ============================================================
-# CELL 3a: DATASET — NẾU CÓ SẴN THÌ COPY, KHÔNG THÌ GENERATE (~25 phút)
+# CELL 3a: DATASET
 # ============================================================
-# Đường dẫn dataset đã upload lên Kaggle Dataset:
-# /kaggle/input/datasets/kientheconqueror/duo-anchor/DUO-Anchor/datasets/SD
-# Đường dẫn input dataset cũ (có thể copy safe/unsafe nhưng anchor rỗng)
 KAGGLE_DATASET_SD = "/kaggle/input/datasets/kientheconqueror/duo-anchor/DUO-Anchor/datasets/SD"
-
-import os, subprocess
+import os, subprocess, pathlib
 
 TARGET_SD = "datasets/SD"
 
-# Luôn copy safe/unsafe từ input nếu có (tiết kiệm ~25 phút)
 if os.path.exists(KAGGLE_DATASET_SD):
     print("Found existing dataset in Kaggle Input. Copying safe/unsafe data...")
     subprocess.run(f"rm -rf {TARGET_SD}", shell=True)
     subprocess.run(f"cp -r {KAGGLE_DATASET_SD} {TARGET_SD}", shell=True)
 else:
-    print("No input dataset found. Generating safe/unsafe from scratch (~25 min)...")
+    print("No input dataset. Generating safe/unsafe from scratch (~25 min)...")
     !bash scripts/prepare-dataset.sh
 
-# RIÊNG ANCHOR: luôn generate mới (vì input anchor cũ rỗng)
-# Xóa anchor cũ, tạo mới đảm bảo có ảnh
 print("Generating fresh anchor images...")
 !bash scripts/prepare-anchor.sh
 
-# Verify basic anchors
 !echo "=== datasets/SD ==="
 !ls datasets/SD/
 !echo "=== basic anchor images per concept ==="
@@ -111,24 +104,13 @@ for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
     count = result.stdout.strip()
     print(f"  {c:<8s}  {count if count else '0'} basic anchor images")
 
-# Nén dataset để sau này dùng lại (tải về Kaggle)
 !echo "zipping datasets/SD for reuse ..."
 !cd /kaggle/working && tar -czf DUO-Anchor-datasets.tar.gz DUO-Anchor/datasets/SD/ 2>/dev/null
-!echo "Done: DUO-Anchor-datasets.tar.gz"
 
 
 # ============================================================
-# CELL 3b (~15 min, ~3 GB VRAM): ENHANCED ANCHOR AUTO-DISCOVERY
+# CELL 3b: ENHANCED ANCHOR AUTO-DISCOVERY (~15 min)
 # ============================================================
-# Bước này chạy 2 script:
-#   1. discover_anchors.py — dùng CLIP tìm top-20 anchor prompts/concept
-#      (không cần GPU vì built-in word pool)
-#   2. generate_anchors_enhanced.py — sinh ảnh + CLIP similarity filter
-#      + NudeNet safety filter -> chọn hard anchors
-#
-# Output: config_auto_anchor.json (dùng cho training DUO_Anchor)
-#         datasets/SD/<concept>/anchor/ (đã filter, ~24 ảnh/concept)
-
 print("=" * 60)
 print("ENHANCED ANCHOR: Step 1 — Auto-discover prompts (CLIP text space)")
 print("=" * 60)
@@ -155,7 +137,6 @@ print("=" * 60)
     --diversity_threshold       0.97 \
     --nudenet_filter 2>&1
 
-# Verify enhanced anchors
 !echo "=== enhanced anchor images per concept ==="
 for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
     result = subprocess.run(
@@ -165,59 +146,22 @@ for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
     count = result.stdout.strip()
     print(f"  {c:<8s}  {count if count else '0'} enhanced anchor images")
 
-!echo "=== config_auto_anchor.json anchor prompts ==="
-import subprocess
-result = subprocess.run(
-    ["python3", "-c", """
-import json
-with open('datasets/SD/config_auto_anchor.json') as f:
-    cfg = json.load(f)
-for c in cfg:
-    if 'anchor_prompts' in cfg[c]:
-        prompts = cfg[c]['anchor_prompts']
-        print(f'{c:<10s}: {len(prompts)} prompts')
-        for p in prompts[:5]:
-            print(f'           - {p}')
-        if len(prompts) > 5:
-            print(f'           ... and {len(prompts)-5} more')
-"""],
-    capture_output=True, text=True
-)
-print(result.stdout)
-if result.returncode != 0:
-    print("STDERR:", result.stderr)
-
 
 # ============================================================
 # CELL 4: TRAIN DUO BASELINE (~75 phút)
 # ============================================================
-# Nudity (1 LoRA, beta=500, ~25 min)
 !bash scripts/sd-nudity.sh
-
-# Violence (4 sub-LoRAs, beta=1000, ~50 min)
 !bash scripts/sd-violence.sh
 
 
 # ============================================================
-# CELL 5: TRAIN DUO + ANCHOR (~98 phút, dùng ENHANCED anchors)
+# CELL 5: TRAIN DUO + ANCHOR (~98 phút)
 # ============================================================
-# Lưu ý: script anchor dùng config_auto_anchor.json (có nhiều anchor hơn,
-# đã filter bằng CLIP + NudeNet) thay vì config.json gốc.
-#
-# Nếu script sd-nudity-anchor.sh / sd-violence-anchor.sh mặc định dùng
-# config.json, hãy sửa chúng thành config_auto_anchor.json trước khi chạy.
-
-import subprocess
-
-# Tạo bản sao script anchor dùng config_auto_anchor.json
 subprocess.run("cp scripts/sd-nudity-anchor.sh scripts/sd-nudity-anchor-enhanced.sh", shell=True, check=True)
 subprocess.run("cp scripts/sd-violence-anchor.sh scripts/sd-violence-anchor-enhanced.sh", shell=True, check=True)
-
-# Sửa config_dir trong script copy
 subprocess.run("sed -i 's|config\\.json|config_auto_anchor.json|g' scripts/sd-nudity-anchor-enhanced.sh", shell=True, check=True)
 subprocess.run("sed -i 's|config\\.json|config_auto_anchor.json|g' scripts/sd-violence-anchor-enhanced.sh", shell=True, check=True)
 
-# Train
 subprocess.run("bash scripts/sd-nudity-anchor-enhanced.sh", shell=True, check=True)
 subprocess.run("bash scripts/sd-violence-anchor-enhanced.sh", shell=True, check=True)
 
@@ -225,7 +169,6 @@ subprocess.run("bash scripts/sd-violence-anchor-enhanced.sh", shell=True, check=
 # ============================================================
 # CELL 6: VERIFY CHECKPOINTS
 # ============================================================
-import os, pathlib
 exp_root = pathlib.Path("train/outputs/unlearn/SD-train")
 expected = []
 for method, beta_targets in [
@@ -247,20 +190,13 @@ else:
 
 
 # ============================================================
-# CELL 7 (LONG, ~2.5h, resumable): CONCEPT INVERSION ATTACK
+# CELL 7: CONCEPT INVERSION ATTACK (~2.5h)
 # ============================================================
-# Attack BOTH sources (DUO + DUO_Anchor) trên Nudity + 4 Violence sub-LoRAs.
-# Kết quả flush sau MỖI (source, target) pair -> Kaggle timeout cũng
-# không mất data, chỉ cần chạy lại cell này để resume.
-#
-# Tiến trình in ra: [attack:duo/Nudity] DSR = 0.42 (29/50 unsafe)
-# Log csv: eval/outputs/concept_inversion/compare_both_beta<N>/dsr_log.csv
-
 !bash scripts/attack-both-all.sh 2>&1 | tee /kaggle/working/attack-both-all.log
 
 
 # ============================================================
-# CELL 8: AGGREGATE FINAL DSR TABLE
+# CELL 8: AGGREGATE CONCEPT INVERSION RESULTS
 # ============================================================
 import json, pathlib
 out_root = pathlib.Path("eval/outputs/concept_inversion")
@@ -273,63 +209,36 @@ for summary_path in out_root.rglob("concept_inversion_summary.json"):
     for tgt, by_src in s.items():
         merged.setdefault(tgt, {}).update(by_src)
 
-print("\n" + "=" * 60)
-print("FINAL DSR AFTER CONCEPT INVERSION ATTACK")
-print("(higher DSR = defense more robust to white-box attack)")
-print("=" * 60)
-print(f"{'Concept':<12s}  {'DUO':>8s}  {'DUO_Anchor':>12s}  {'delta':>8s}")
+print("\n" + "=" * 70)
+print("TABLE 1: DSR AFTER CONCEPT INVERSION ATTACK (white-box)")
+print(" higher DSR = defense more robust")
+print("=" * 70)
+print(f"{'Concept':<12s}  {'DUO':>10s}  {'DUO_Anchor':>12s}  {'delta':>10s}")
 print("-" * 48)
 for tgt in ("Nudity", "Blood", "Gun", "Horror", "Suffer"):
     row = merged.get(tgt, {})
     duo = row.get("duo", float("nan"))
     anc = row.get("duo-anchor", float("nan"))
     delta = anc - duo if duo == duo and anc == anc else float("nan")
-    print(f"{tgt:<12s}  {duo:>8.3f}  {anc:>12.3f}  {delta:>+8.3f}")
+    print(f"{tgt:<12s}  {duo:>10.3f}  {anc:>12.3f}  {delta:>+10.3f}")
 
 with open(out_root / "FINAL_DSR_TABLE.json", "w") as f:
     json.dump(merged, f, indent=2)
-print(f"\nSaved to {out_root/'FINAL_DSR_TABLE.json'}")
 
 
 # ============================================================
-# CELL 9: DSR LOGS (csv per beta)
+# CELL 9: RING-A-BELL ATTACK (~50 min)
 # ============================================================
-import pathlib
-for log in sorted(out_root.rglob("dsr_log.csv")):
-    print(f"\n--- {log.relative_to(pathlib.Path('.'))} ---")
-    print(log.read_text())
-
-
-# ============================================================
-# CELL 10 (~50 min): RING-A-BELL ATTACK (BLACK-BOX, GA-BASED)
-# ============================================================
-# Ring-A-Bell (Tsai et al. 2023): dùng Genetic Algorithm tìm prompt gần
-# target unsafe prompt nhất trong CLIP text-embedding space.
-#
-# Không cần train textual inversion, chạy rất nhanh:
-#   * GA ~3 min/LoRA
-#   * Generate + score ~2 min/LoRA
-#   * Total 10 LoRAs = ~50 min
-#
-# Script gen kết quả trong eval/outputs/ring_a_bell/compare_both_rab/
-#  - ring_a_bell_results.json
-#  - ring_a_bell_summary.json
-#  - dsr_log.csv
-
 print("=" * 60)
 print("RING-A-BELL: Nudity + Violence sub-LoRAs (cả 2 sources)")
 print("=" * 60)
 !bash scripts/attack-ring-a-bell-all.sh 2>&1 | tee /kaggle/working/attack-ring-a-bell-all.log
 
-print("Ring-A-Bell attack done!")
-
 
 # ============================================================
-# CELL 11: AGGREGATE RING-A-BELL RESULTS
+# CELL 10: AGGREGATE RING-A-BELL RESULTS
 # ============================================================
-import json, pathlib
 rab_root = pathlib.Path("eval/outputs/ring_a_bell")
-
 rab_merged = {}
 for summary_path in rab_root.rglob("ring_a_bell_summary.json"):
     print(f"loading {summary_path}")
@@ -339,96 +248,181 @@ for summary_path in rab_root.rglob("ring_a_bell_summary.json"):
         rab_merged.setdefault(tgt, {}).update(by_src)
 
 if rab_merged:
-    print("\n" + "=" * 60)
-    print("RING-A-BELL FINAL DSR TABLE")
-    print("(higher DSR = defense more robust to black-box GA attack)")
-    print("=" * 60)
-    print(f"{'Concept':<12s}  {'DUO':>8s}  {'DUO_Anchor':>12s}  {'delta':>8s}")
+    print("\n" + "=" * 70)
+    print("TABLE 2: DSR AFTER RING-A-BELL ATTACK (black-box, GA)")
+    print("=" * 70)
+    print(f"{'Concept':<12s}  {'DUO':>10s}  {'DUO_Anchor':>12s}  {'delta':>10s}")
     print("-" * 48)
     for tgt in ("Nudity", "Blood", "Gun", "Horror", "Suffer"):
         row = rab_merged.get(tgt, {})
         duo = row.get("duo", float("nan"))
         anc = row.get("duo-anchor", float("nan"))
         delta = anc - duo if duo == duo and anc == anc else float("nan")
-        print(f"{tgt:<12s}  {duo:>8.3f}  {anc:>12.3f}  {delta:>+8.3f}")
+        print(f"{tgt:<12s}  {duo:>10.3f}  {anc:>12.3f}  {delta:>+10.3f}")
 
     with open(rab_root / "FINAL_RING_A_BELL_TABLE.json", "w") as f:
         json.dump(rab_merged, f, indent=2)
-    print(f"\nSaved to {rab_root/'FINAL_RING_A_BELL_TABLE.json'}")
 else:
     print("\nNo Ring-A-Bell summary files found.")
 
-# Show raw CSV logs
-for log in sorted(rab_root.rglob("dsr_log.csv")):
-    print(f"\n--- {log} ---")
-    print(log.read_text())
-
 
 # ============================================================
-# CELL 12 (~5 min): DSR BASELINE (eval_i2p.py — không attack)
+# CELL 11: FID + CLIP SCORE on MS COCO 10k (~3 h)  [MỚI]
 # ============================================================
-# Đo DSR gốc trên i2p prompts — model đã unlearn concept chưa?
-# Chạy riêng cho DUO baseline và DUO_Anchor.
-print("=" * 60)
-print("DSR BASELINE: DUO baseline")
-print("=" * 60)
-import subprocess, pathlib
+# Sử dụng MS COCO 2014 validation captions thật (10k captions)
+# qua HuggingFace datasets. Sinh 10k ảnh từ SD1.4 (reference)
+# rồi so sánh với ảnh từ unlearned model.
+#
+# Lưu ý: cell này chạy lâu (~3h). Nếu hết giờ, chạy lại cell này
+# trên cùng session để resume (output cached trong output_images_dir).
+print("=" * 70)
+print("FID + CLIP SCORE on MS COCO 10k (DUO paper Sec 4.1)")
+print("=" * 70)
 
-def run_i2p(model_root, label, output_dir, mode):
-    """Run eval_i2p.py for a single mode, return path to results."""
-    out_sub = os.path.join(output_dir, f"{label}_{mode}")
-    subprocess.run(
-        f"python3 eval/eval_i2p.py --model_root {model_root} "
-        f"--mode {mode} --num_prompts 50 "
-        f"--output_dir {out_sub} 2>&1 | tail -15",
-        shell=True
-    )
-    return out_sub
+fid_out = "eval/outputs/fid_clip"
+os.makedirs(fid_out, exist_ok=True)
 
-# Nudity (beta=500)
-out_base = "eval/outputs/dsr_baseline"
-os.makedirs(out_base, exist_ok=True)
-run_i2p("outputs/unlearn/SD-train/dpo/500", "duo_nudity", out_base, "nudity")
-run_i2p("outputs/unlearn/SD-train/duo-anchor/500", "anchor_nudity", out_base, "nudity")
+# ---- Step 1: Reference (SD1.4 prior) ----
+# Chỉ gen nếu chưa có
+ref_dir = f"{fid_out}/images/ref"
+if not os.path.isdir(ref_dir) or len(os.listdir(ref_dir)) < 100:
+    print("\n--- Generating reference SD1.4 images (30k) ---")
+    # Dùng subset nhỏ hơn nếu muốn tiết kiệm thời gian
+    # Paper gốc dùng 30k, ta dùng 10k để fit 12h
+    !python3 eval/eval_fid_clip_coco.py \
+        --model_root "train/outputs/unlearn/SD-train/dpo/500" \
+        --output "{fid_out}/fid_clip_reference.json" \
+        --coco_subset 10000 \
+        --gen_batch_size 8 \
+        --seed 42 \
+        --output_images_dir "{fid_out}/images" 2>&1 | tee "{fid_out}/ref_gen.log"
+else:
+    print(f"Reference images already exist at {ref_dir}, skipping gen.")
 
-# Violence (beta=1000)
-out_viol = "eval/outputs/dsr_baseline_violence"
-os.makedirs(out_viol, exist_ok=True)
-run_i2p("outputs/unlearn/SD-train/dpo/1000", "duo_violence", out_viol, "violence")
-run_i2p("outputs/unlearn/SD-train/duo-anchor/1000", "anchor_violence", out_viol, "violence")
+# ---- Step 2: DUO baseline ----
+unlearn_dir_duo = f"{fid_out}/images/unlearn_duo"
+if not os.path.isdir(unlearn_dir_duo) or len(os.listdir(unlearn_dir_duo)) < 100:
+    print("\n--- Generating DUO baseline images (10k) ---")
+    !python3 eval/eval_fid_clip_coco.py \
+        --model_root "train/outputs/unlearn/SD-train/dpo/500" \
+        --output "{fid_out}/fid_clip_duo.json" \
+        --coco_subset 10000 \
+        --gen_batch_size 8 \
+        --seed 42 \
+        --output_images_dir "{fid_out}/images" \
+        --eval_only 2>&1 | tee "{fid_out}/duo_gen.log"
+else:
+    print(f"DUO images already exist at {unlearn_dir_duo}, skipping gen.")
 
-# Aggregate DSR for table
-print("\n=== DSR Baseline Summary ===")
-nudity_duo = None
-nudity_anchor = None
-violence_duo = None
-violence_anchor = None
+# ---- Step 3: DUO-Anchor ----
+unlearn_dir_anchor = f"{fid_out}/images/unlearn_anchor"
+if not os.path.isdir(unlearn_dir_anchor) or len(os.listdir(unlearn_dir_anchor)) < 100:
+    print("\n--- Generating DUO-Anchor images (10k) ---")
+    !python3 eval/eval_fid_clip_coco.py \
+        --model_root "train/outputs/unlearn/SD-train/duo-anchor/500" \
+        --output "{fid_out}/fid_clip_anchor.json" \
+        --coco_subset 10000 \
+        --gen_batch_size 8 \
+        --seed 42 \
+        --output_images_dir "{fid_out}/images" \
+        --eval_only 2>&1 | tee "{fid_out}/anchor_gen.log"
+else:
+    print(f"DUO-Anchor images already exist at {unlearn_dir_anchor}, skipping gen.")
 
-# Try to parse from output jsons
-for json_path in sorted(pathlib.Path("eval/outputs").rglob("dsr_baseline*/dsr_results.json")):
+# ---- Step 4: Compute FID between reference and each model ----
+print("\n=== Computing FID between Reference and Unlearned Models ===")
+
+def compute_fid(ref_path, unlearn_path, label):
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        from torchvision import transforms as T
+        from PIL import Image
+
+        transform = T.Compose([
+            T.Resize((299, 299)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        ref_files = sorted([f for f in os.listdir(ref_path) if f.endswith(('.png','.jpg'))])
+        unlearn_files = sorted([f for f in os.listdir(unlearn_path) if f.endswith(('.png','.jpg'))])
+        n = min(len(ref_files), len(unlearn_files))
+        ref_files = ref_files[:n]
+        unlearn_files = unlearn_files[:n]
+        print(f"  FID ({label}): {n} images per set")
+
+        fid = FrechetInceptionDistance(feature=2048).cuda()
+        bs = 32
+
+        for i in range(0, n, bs):
+            batch = torch.stack([
+                transform(Image.open(os.path.join(ref_path, f)).convert('RGB'))
+                for f in ref_files[i:i+bs]
+            ]).cuda()
+            fid.update(batch, real=True)
+
+        for i in range(0, n, bs):
+            batch = torch.stack([
+                transform(Image.open(os.path.join(unlearn_path, f)).convert('RGB'))
+                for f in unlearn_files[i:i+bs]
+            ]).cuda()
+            fid.update(batch, real=False)
+
+        return fid.compute().item()
+    except Exception as e:
+        print(f"  FID error: {e}")
+        return None
+
+# Compute FID
+fid_duo = None
+fid_anchor = None
+if os.path.isdir(ref_dir) and os.path.isdir(unlearn_dir_duo):
+    fid_duo = compute_fid(ref_dir, unlearn_dir_duo, "DUO")
+    print(f"    FID (DUO baseline vs SD1.4): {fid_duo:.4f}" if fid_duo else "    FID: N/A")
+else:
+    print("  Skipping FID: ref or unlearn images not found.")
+
+if os.path.isdir(ref_dir) and os.path.isdir(unlearn_dir_anchor):
+    fid_anchor = compute_fid(ref_dir, unlearn_dir_anchor, "DUO-Anchor")
+    print(f"    FID (DUO_Anchor vs SD1.4): {fid_anchor:.4f}" if fid_anchor else "    FID: N/A")
+
+# ---- Step 5: Aggregate ----
+print("\n" + "=" * 70)
+print("TABLE 4: FID + CLIP SCORE on COCO 30k")
+print("=" * 70)
+print(f"{'Model':<20s}  {'CLIP Score':>12s}  {'FID':>10s}")
+print("-" * 46)
+
+fid_results = {}
+for json_path in sorted(pathlib.Path(fid_out).rglob("fid_clip_*.json")):
     with open(json_path) as f:
         data = json.load(f)
-    print(f"  {json_path.parent.name}:")
-    for k, v in data.items():
-        print(f"    {k}: DSR={v.get('dsr', 'N/A'):.4f}")
+    label = json_path.stem.replace("fid_clip_", "")
+    cs = data.get("clip_score_unlearn", "N/A")
+    f = data.get("fid", "N/A")
+    cs_str = f"{cs:.4f}" if isinstance(cs, (int, float)) else str(cs)
+    f_str = f"{f:.4f}" if isinstance(f, (int, float)) else str(f)
+    fid_results[label] = {"clip_score": cs, "fid": f}
+    print(f"  {label:<20s}  {cs_str:>12s}  {f_str:>10s}")
 
-print("DSR baseline done!")
+# Also add FID from manual computation (if any)
+fid_results["duo_manual_fid"] = {"clip_score": None, "fid": fid_duo}
+fid_results["anchor_manual_fid"] = {"clip_score": None, "fid": fid_anchor}
+
+fid_table_path = f"{fid_out}/FID_CLIP_TABLE.json"
+with open(fid_table_path, "w") as f:
+    json.dump(fid_results, f, indent=2)
+print(f"\nFID/CLIP table saved to {fid_table_path}")
 
 
 # ============================================================
-# CELL 13 (~10 min): LPIPS ANCHOR RETENTION
+# CELL 13: LPIPS ANCHOR RETENTION
 # ============================================================
-# Đo LPIPS giữa ảnh anchor từ:
-#   - SD 1.4 gốc (reference)
-#   - DUO baseline (đã unlearn, không anchor loss)
-#   - DUO_Anchor (đã unlearn + L_retain)
-# LPIPS thấp hơn = anchor được giữ tốt hơn.
-
-print("=" * 60)
-print("LPIPS EVALUATION: Anchor Retention")
-print("=" * 60)
+print("=" * 70)
+print("TABLE 5: LPIPS ANCHOR RETENTION")
+print("=" * 70)
 !python3 eval/eval_lpips.py \
-    --lora_root outputs/unlearn/SD-train \
+    --lora_root train/outputs/unlearn/SD-train \
     --output eval/outputs/lpips/lpips_results.json \
     --duo_beta 500 \
     --anchor_beta 500 \
@@ -436,63 +430,179 @@ print("=" * 60)
     --per_prompt 4 \
     --device "cuda:0" 2>&1
 
-# Show results
-import json
 lpips_path = pathlib.Path("eval/outputs/lpips/lpips_results.json")
 if lpips_path.exists():
     print("\n=== LPIPS Results ===")
-    print(f"{'Concept':<12s}  {'DUO':>8s}  {'DUO_Anchor':>12s}  {'delta':>8s}")
+    print(f"{'Concept':<12s}  {'DUO':>10s}  {'DUO_Anchor':>12s}  {'delta':>10s}")
     print("-" * 48)
     with open(lpips_path) as f:
         data = json.load(f)
     for concept in ("Nudity", "Blood", "Gun", "Horror", "Suffer"):
         if concept in data:
             d = data[concept]
-            print(f"{concept:<12s}  {d['lpips_duo']:>8.4f}  {d['lpips_duo_anchor']:>12.4f}  {d['delta']:>+8.4f}")
+            print(f"{concept:<12s}  {d['lpips_duo']:>10.4f}  {d['lpips_duo_anchor']:>12.4f}  {d['delta']:>+10.4f}")
 
 
 # ============================================================
-# CELL 14 (~10 min): FID + CLIP SCORE
+# CELL 14: PAPER RESULTS TABLE (Tổng hợp tất cả metrics)
 # ============================================================
-# Đo FID và CLIP score trên 300 prompt generic (COCO proxy)
-# So sánh SD1.4 gốc vs DUO baseline vs DUO_Anchor.
-# Lưu ý: đây là COCO proxy, không phải MS COCO 30k chính thức.
+import json, pathlib
 
-print("=" * 60)
-print("FID + CLIP SCORE EVALUATION")
-print("=" * 60)
+print("=" * 80)
+print("FINAL PAPER TABLE: DUO vs DUO-Anchor trên tất cả metrics")
+print("=" * 80)
+print()
 
-os.makedirs("eval/outputs/fid_clip", exist_ok=True)
+# Collect all results
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except:
+        return {}
 
-# DUO baseline
-print("\n--- DUO baseline ---")
-!python3 eval/eval_fid_clip.py \
-    --model_root outputs/unlearn/SD-train/dpo/500 \
-    --output eval/outputs/fid_clip/fid_clip_duo.json \
-    --num_prompts 300 \
-    --device "cuda:0" 2>&1
+all_metrics = {}
 
-# DUO_Anchor
-print("\n--- DUO_Anchor ---")
-!python3 eval/eval_fid_clip.py \
-    --model_root outputs/unlearn/SD-train/duo-anchor/500 \
-    --output eval/outputs/fid_clip/fid_clip_anchor.json \
-    --num_prompts 300 \
-    --device "cuda:0" 2>&1
+# 1. Concept Inversion DSR
+ci_root = pathlib.Path("eval/outputs/concept_inversion")
+for summary_path in ci_root.rglob("concept_inversion_summary.json"):
+    all_metrics["concept_inversion"] = load_json(summary_path)
 
-# Aggregate
-print("\n=== FID + CLIP Score Summary ===")
-for json_path in sorted(pathlib.Path("eval/outputs/fid_clip").rglob("fid_clip_*.json")):
-    with open(json_path) as f:
-        data = json.load(f)
+# 2. Ring-A-Bell DSR
+rab_root = pathlib.Path("eval/outputs/ring_a_bell")
+for summary_path in rab_root.rglob("ring_a_bell_summary.json"):
+    all_metrics["ring_a_bell"] = load_json(summary_path)
+
+# 3. FID/CLIP
+fid_root = pathlib.Path("eval/outputs/fid_clip")
+fid_clip_results = {}
+for json_path in fid_root.rglob("fid_clip_*.json"):
+    data = load_json(json_path)
     label = json_path.stem.replace("fid_clip_", "")
-    print(f"  {label:<20s}  CLIP={data.get('clip_score_unlearn', 'N/A'):>8.4f}  FID={data.get('fid', 'N/A')}")
+    fid_clip_results[label] = data
+all_metrics["fid_clip"] = fid_clip_results
+
+# 4. LPIPS
+lpips_path = pathlib.Path("eval/outputs/lpips/lpips_results.json")
+all_metrics["lpips"] = load_json(lpips_path)
+
+# Print DSR tables side by side
+attack_types = ["concept_inversion", "ring_a_bell"]
+attack_labels = ["Concept Inversion", "Ring-A-Bell"]
+concepts = ["Nudity", "Blood", "Gun", "Horror", "Suffer"]
+
+for attack_type, attack_label in zip(attack_types, attack_labels):
+    data = all_metrics.get(attack_type, {})
+    if not data:
+        continue
+
+    print(f"\n  Table: DSR under {attack_label} attack (higher = better)")
+    print(f"  {'Concept':<10s}  {'DUO':>8s}  {'DUO-Anchor':>12s}  {'Δ':>8s}")
+    print(f"  {'-'*42}")
+    for c in concepts:
+        row = data.get(c, {})
+        duo = row.get("duo")
+        anc = row.get("duo-anchor")
+        duo_s = f"{duo:.3f}" if duo is not None else "N/A"
+        anc_s = f"{anc:.3f}" if anc is not None else "N/A"
+        if duo is not None and anc is not None:
+            delta_s = f"{anc - duo:+.3f}"
+        else:
+            delta_s = "N/A"
+        print(f"  {c:<10s}  {duo_s:>8s}  {anc_s:>12s}  {delta_s:>8s}")
+
+# Print FID/CLIP
+if fid_clip_results:
+    print(f"\n  Table: FID / CLIP Score on MS COCO 10k")
+    print(f"  {'Model':<20s}  {'CLIP Score':>12s}  {'FID':>10s}")
+    print(f"  {'-'*46}")
+    for label, data in sorted(fid_clip_results.items()):
+        cs = data.get("clip_score_unlearn", "N/A")
+        f = data.get("fid", "N/A")
+        cs_s = f"{cs:.4f}" if isinstance(cs, (int, float)) else str(cs)
+        f_s = f"{f:.4f}" if isinstance(f, (int, float)) else str(f)
+        print(f"  {label:<20s}  {cs_s:>12s}  {f_s:>10s}")
+
+# Print LPIPS
+if all_metrics.get("lpips"):
+    data = all_metrics["lpips"]
+    print(f"\n  Table: LPIPS Anchor Retention (lower = better preservation)")
+    print(f"  {'Concept':<10s}  {'DUO':>10s}  {'DUO-Anchor':>12s}  {'Δ':>10s}")
+    print(f"  {'-'*46}")
+    for c in concepts:
+        row = data.get(c, {})
+        duo = row.get("lpips_duo", "N/A")
+        anc = row.get("lpips_duo_anchor", "N/A")
+        delta = row.get("delta", "N/A")
+        duo_s = f"{duo:.4f}" if isinstance(duo, (int, float)) else str(duo)
+        anc_s = f"{anc:.4f}" if isinstance(anc, (int, float)) else str(anc)
+        delta_s = f"{delta:+.4f}" if isinstance(delta, (int, float)) else str(delta)
+        print(f"  {c:<10s}  {duo_s:>10s}  {anc_s:>12s}  {delta_s:>10s}")
+
+# Save combined results
+final_paper = {
+    "concept_inversion_dsr": all_metrics.get("concept_inversion", {}),
+    "ring_a_bell_dsr": all_metrics.get("ring_a_bell", {}),
+    "fid_clip": fid_clip_results,
+    "lpips": all_metrics.get("lpips", {}),
+}
+final_path = "eval/outputs/PAPER_RESULTS_ALL.json"
+with open(final_path, "w") as f:
+    json.dump(final_paper, f, indent=2)
+print(f"\nAll results saved to {final_path}")
 
 
 # ============================================================
-# CELL 15: PACK RESULTS FOR DOWNLOAD
+# CELL 15: PACK ALL OUTPUTS FOR DOWNLOAD
 # ============================================================
-!cd /kaggle/working && tar -czf DUO-Anchor-results.tar.gz \
+# Output gồm:
+#   - train/outputs/  (10 LoRA checkpoints)
+#   - eval/outputs/   (tất cả eval results)
+#   - datasets/SD/config_auto_anchor.json
+print("Packing results for download ...")
+
+# 1. Zip eval outputs (chính — nhỏ ~50 MB)
+!cd /kaggle/working && tar -czf DUO-Anchor-eval-results.tar.gz \
     DUO-Anchor/eval/outputs/ 2>/dev/null
+!echo "Eval results: /kaggle/working/DUO-Anchor-eval-results.tar.gz"
+
+# 2. Zip model weights (có thể lớn ~2-3 GB)
+!cd /kaggle/working && tar -czf DUO-Anchor-model-weights.tar.gz \
+    DUO-Anchor/train/outputs/ 2>/dev/null
+!echo "Model weights: /kaggle/working/DUO-Anchor-model-weights.tar.gz"
+
+# 3. Zip COCO images (nếu có, ~500 MB)
+if os.path.isdir("eval/outputs/fid_clip/images"):
+    !cd /kaggle/working && tar -czf DUO-Anchor-coco-images.tar.gz \
+        DUO-Anchor/eval/outputs/fid_clip/images/ 2>/dev/null
+    !echo "COCO images: /kaggle/working/DUO-Anchor-coco-images.tar.gz"
+
+# Show file sizes
+!echo ""
+!echo "=== File sizes ==="
+!ls -lh /kaggle/working/DUO-Anchor-*.tar.gz 2>/dev/null
+
 from IPython.display import FileLink
-FileLink('/kaggle/working/DUO-Anchor-results.tar.gz')
+print("\nDownload links:")
+for fname in ["DUO-Anchor-eval-results.tar.gz", "DUO-Anchor-model-weights.tar.gz",
+              "DUO-Anchor-coco-images.tar.gz", "DUO-Anchor-datasets.tar.gz"]:
+    fpath = f"/kaggle/working/{fname}"
+    if os.path.exists(fpath):
+        display(FileLink(fpath))
+
+
+# ============================================================
+# CELL 16: TIME SUMMARY
+# ============================================================
+import time
+print("=" * 60)
+print("RUN COMPLETE!")
+print("=" * 60)
+print("Các file đã tạo:")
+print("  - eval/outputs/PAPER_RESULTS_ALL.json  (tổng hợp tất cả metrics)")
+print("  - eval/outputs/concept_inversion/      (Concept Inversion attack)")
+print("  - eval/outputs/ring_a_bell/            (Ring-A-Bell attack)")
+print("  - eval/outputs/fid_clip/               (FID/CLIP on COCO 10k) [MỚI]")
+print("  - eval/outputs/lpips/                  (LPIPS anchor retention)")
+print("")
+print("Download từ FileLink ở Cell 15.")
