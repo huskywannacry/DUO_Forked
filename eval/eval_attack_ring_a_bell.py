@@ -193,7 +193,8 @@ def parse_args():
     p.add_argument("--mode", choices=("nudity", "violence_sub", "all"),
                    default="all")
     p.add_argument("--config_dir", type=str,
-                   default="datasets/SD/config.json")
+                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", "datasets", "SD", "config.json"))
     p.add_argument("--i2p_nudity", type=str,
                    default="datasets/i2p/sexual.jsonl")
     p.add_argument("--i2p_violence", type=str,
