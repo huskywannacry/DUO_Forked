@@ -11,7 +11,7 @@ export CUDA_VISIBLE_DEVICES=0
 # * Fits comfortably inside the 12 h background-session budget.
 
 base_dir=$(pwd)
-save_dir="./train/outputs"
+save_dir="$base_dir/outputs"
 exp_root="$save_dir/unlearn/SD-train"
 
 cd $base_dir/eval

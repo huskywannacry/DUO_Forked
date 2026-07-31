@@ -49,7 +49,9 @@ if not os.path.exists("/kaggle/working/DUO-Anchor"):
 
 !pip install -q -r requirements.txt
 !pip install -q --upgrade diffusers transformers accelerate
-!pip install -q --upgrade --force-reinstall 'peft>=0.17.0'
+# Uninstall torchao (0.10.0) which conflicts with peft>=0.17.0 required by new diffusers
+!pip uninstall -y torchao
+!pip install -q --upgrade 'peft>=0.17.0'
 !pip install -q git+https://github.com/notAI-tech/NudeNet.git
 
 import torch
