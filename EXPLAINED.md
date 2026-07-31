@@ -696,7 +696,136 @@ Với `x⁻_adv = x⁻ + PGD_attack(x⁻)` (Idea 9.3: adversarial perturbation).
 
 ---
 
-## 10. Tóm tắt 1 câu
+## 11. Giải thích source code
+
+### 11.1 File cốt lõi
+
+| File | Chức năng | Input | Output |
+|---|---|---|---|
+| `train/unlearn-sd.py` | Training script chính | config.json + dataset | LoRA weights |
+| `datasets/SD/generate_datasets.py` | Tạo paired dataset bằng SDEdit | config.json | unsafe/ + safe/ |
+| `datasets/SD/generate_anchors.py` | Sinh anchor cơ bản (cũ) | config.json + SD | anchor/ |
+| `datasets/SD/discover_anchors.py` | Auto tìm anchor prompts | config.json + CLIP | config_auto_anchor.json |
+| `datasets/SD/generate_anchors_enhanced.py` | Sinh + filter anchor (mới) | config_auto_anchor.json | anchor/ + metadata |
+| `eval/eval_i2p.py` | Đo DSR gốc trên i2p prompts | LoRA + i2p | DSR table |
+| `eval/eval_attack_concept_inversion.py` | White-box attack (TI token) | LoRA + i2p | DSR sau attack |
+| `eval/eval_attack_ring_a_bell.py` | Black-box attack (GA prompt) | LoRA + i2p + CLIP | DSR sau attack |
+| `eval/eval_lpips.py` | Đo LPIPS anchor retention | LoRA + SD gốc | LPIPS table |
+| `KAGGLE_NOTEBOOK.py` | Pipeline chạy trên Kaggle | — | Kết quả DSR + LPIPS |
+
+### 11.2 train/unlearn-sd.py — Training Loop
+
+```
+Hàm main() (dòng 677-1532):
+  1. Load SD 1.4 (UNet, VAE, text_encoder) → dòng 774-782
+  2. Thêm LoRA adapter vào UNet (rank=32) → dòng 803-809
+  3. Tạo dataset: TrainDataset(args) → dòng 907
+     - Đọc config.json → unsafe/ + safe/ + anchor/ paths
+     - Load ảnh, shuffle, transform
+  4. AdamW optimizer + scheduler → dòng 980-1003
+  5. Training loop (dòng 1186-1499):
+     a. Encode prompt → text embeddings (dòng 1201-1207)
+     b. VAE encode ảnh → latents (dòng 1216-1221)
+     c. Sample noise + random timestep → noisy latents (dòng 1223-1254)
+     d. UNet forward → predict noise (dòng 1260-1265)
+     e. Reference UNet (disable LoRA) → refer_pred (dòng 1267-1281)
+     f. Tính L_DPO (dòng 1300-1335)
+     g. Tính L_prior tại t=T (dòng 1341-1351)
+     h. Tính L_retain trên ảnh anchor (dòng 1360-1395)
+     i. Backward + optimizer.step (dòng 1397-1410)
+     j. Validation mỗi 500 steps (dòng 1476-1498)
+  6. Save LoRA weights → dòng 1500-1521
+```
+
+**3 loss component**:
+
+| Loss | Công thức | Tác dụng |
+|---|---|---|
+| **L_DPO** (dòng 1300-1335) | `-log σ(β·(loss_base-loss_pred))` | Model thích ảnh safe hơn unsafe |
+| **L_prior** (dòng 1341-1351) | `MSE(ε_θ(x_T), ε_ϕ(x_T))` | Giữ noise prediction ở t=T |
+| **L_retain** (dòng 1391-1394) | `MSE(ε_θ(x_anc_t), noise)` | Giữ noise prediction trên ảnh anchor |
+
+### 11.3 eval/eval_attack_concept_inversion.py — White-box Attack
+
+```
+1. collect_train_images(dòng 170-177):
+   - Dùng UNLEARNED model + i2p prompts sinh ảnh → training set (4 ảnh)
+
+2. train_textual_inversion(dòng 180-328):
+   - Thêm token <c> vào tokenizer (dòng 223)
+   - Init embedding từ "object" (dòng 227-229)
+   - Freeze VAE + UNet + text_encoder (dòng 231-234)
+   - Chỉ train embedding của <c> (dòng 234)
+   - Loss = MSE(ε_θ(x_t, t, text_emb[<c>]), noise) (dòng 304)
+   - Adam, lr=5e-3, batch=4, 3000 steps
+
+3. generate_attack(dòng 331-339):
+   - Prompt = "<c> <i2p prompt>" → sinh ảnh
+
+4. score_images(dòng 342-354):
+   - NudeNet/GPT-4o → DSR = 1 - unsafe/total
+```
+
+### 11.4 eval/eval_attack_ring_a_bell.py — Black-box Attack (GA)
+
+```
+1. ring_a_bell_ga(dòng 106-177):
+   - Target: unsafe prompt embedding
+   - Population: 100 prompts từ i2p seed pool, 50 generations
+   - Mỗi gen: embed → fitness → elitism → crossover → mutate
+   - Fitness = cosine similarity với target embedding
+
+2. generate_attack(dòng 346-367)
+3. score(dòng 258-269) → DSR
+```
+
+### 11.5 datasets/SD/discover_anchors.py — Auto Anchor Discovery
+
+```
+1. Đọc config.json → target prompts
+2. Load CLIP → embed target → target_emb
+3. Từ BUILTIN_WORD_POOL (~200 prompts):
+   - Embed từng prompt → cosine similarity(target_emb)
+   - Filter (sim_min=0.55, sim_max=0.88)
+   - Top_k=20 → ghi config_auto_anchor.json
+```
+
+### 11.6 datasets/SD/generate_anchors_enhanced.py — Enhanced Anchor
+
+```
+1. Đọc 20 anchor prompts từ config_auto_anchor.json
+2. SD 1.4 → sinh 6 ảnh/prompt = 120 ảnh/concept
+3. (Optional) NudeNet filter NSFW
+4. CLIP image embed → select_hard_anchors():
+   - similarity với target unsafe: 0.4-0.9
+   - mutual similarity giữa các anchor: < 0.97 (diversity)
+   - Max 24 ảnh/concept
+5. Clear + save + _anchor_metadata.json
+```
+
+### 11.7 Các hàm phụ trợ
+
+| File | Hàm | Chức năng |
+|---|---|---|
+| `train/unlearn-sd.py` | `TrainDataset.__init__()` | Load unsafe + safe + anchor images |
+| | `collate_fn()` | Stack batch tensors |
+| | `encode_prompt()` | Tokenize + embed prompts |
+| | `validation()` | Generate images để log wandb |
+| `eval_attack_concept_inversion.py` | `find_lora()` | Tìm .safetensors path |
+| | `load_pipeline_*()` | Load SD + LoRA pipe |
+| | `flush_partial()` | Ghi kết quả từng phần (resumable) |
+| `eval_attack_ring_a_bell.py` | `load_clip()` | Load CLIP model |
+| | `ga_mutate()` | Thay từ ngẫu nhiên trong prompt |
+| | `ga_crossover()` | Word-level crossover |
+| | `run_for_target()` | GA → generate → score cho 1 target |
+| `generate_anchors_enhanced.py` | `select_hard_anchors()` | CLIP sim filter + diversity |
+| | `nudity_filter()` | NudeNet filter |
+| `discover_anchors.py` | `discover_anchors_clip()` | CLIP text sim ranking |
+| | `is_safe_prompt()` | Keyword blocklist filter |
+
+---
+
+## 12. Tóm tắt 1 câu
 
 > DUO-Anchor = DUO paper + 1 loss `L_retain` giữ visual anchor (đa-timestep) → giải quyết selectivity (vấn đề tác giả DUO thừa nhận chưa fix), reproduce đầy đủ white-box attack protocol của paper để đo DSR trên cả DUO baseline và DUO-Anchor.
 

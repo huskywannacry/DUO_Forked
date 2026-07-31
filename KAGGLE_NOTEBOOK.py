@@ -48,10 +48,8 @@ if not os.path.exists("/kaggle/working/DUO-Anchor"):
 %cd /kaggle/working/DUO-Anchor
 
 !pip install -q -r requirements.txt
-!pip install -q --upgrade diffusers transformers accelerate
-# Uninstall torchao (0.10.0) which conflicts with peft>=0.17.0 required by new diffusers
-!pip uninstall -y torchao
-!pip install -q --upgrade 'peft>=0.17.0'
+# Pin known-good versions compatible with Kaggle's torchao 0.10.0
+!pip install -q 'diffusers<=0.29.0' 'peft<=0.12.0' 'transformers<=4.44.0' 'accelerate<=1.0.0'
 !pip install -q git+https://github.com/notAI-tech/NudeNet.git
 
 import torch
@@ -76,19 +74,35 @@ except Exception as e:
 
 
 # ============================================================
-# CELL 3a: PREPARE DATA + BASIC ANCHOR IMAGES (~25 phút)
+# CELL 3a: DATASET — NẾU CÓ SẴN THÌ COPY, KHÔNG THÌ GENERATE (~25 phút)
 # ============================================================
-# Generate paired unsafe/safe datasets bằng SDEdit (vẫn dùng config.json gốc)
-!bash scripts/prepare-dataset.sh
+# Đường dẫn dataset đã upload lên Kaggle Dataset:
+# /kaggle/input/datasets/kientheconqueror/duo-anchor/DUO-Anchor/datasets/SD
+# Đường dẫn input dataset cũ (có thể copy safe/unsafe nhưng anchor rỗng)
+KAGGLE_DATASET_SD = "/kaggle/input/datasets/kientheconqueror/duo-anchor/DUO-Anchor/datasets/SD"
 
-# Generate basic anchor images (config.json hand-curated anchors, fallback)
+import os, subprocess
+
+TARGET_SD = "datasets/SD"
+
+# Luôn copy safe/unsafe từ input nếu có (tiết kiệm ~25 phút)
+if os.path.exists(KAGGLE_DATASET_SD):
+    print("Found existing dataset in Kaggle Input. Copying safe/unsafe data...")
+    subprocess.run(f"rm -rf {TARGET_SD}", shell=True)
+    subprocess.run(f"cp -r {KAGGLE_DATASET_SD} {TARGET_SD}", shell=True)
+else:
+    print("No input dataset found. Generating safe/unsafe from scratch (~25 min)...")
+    !bash scripts/prepare-dataset.sh
+
+# RIÊNG ANCHOR: luôn generate mới (vì input anchor cũ rỗng)
+# Xóa anchor cũ, tạo mới đảm bảo có ảnh
+print("Generating fresh anchor images...")
 !bash scripts/prepare-anchor.sh
 
 # Verify basic anchors
 !echo "=== datasets/SD ==="
 !ls datasets/SD/
 !echo "=== basic anchor images per concept ==="
-import subprocess
 for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
     result = subprocess.run(
         f"ls datasets/SD/{c}/anchor/ 2>/dev/null | wc -l",
@@ -96,6 +110,11 @@ for c in ["Nudity", "Blood", "Gun", "Horror", "Suffer"]:
     )
     count = result.stdout.strip()
     print(f"  {c:<8s}  {count if count else '0'} basic anchor images")
+
+# Nén dataset để sau này dùng lại (tải về Kaggle)
+!echo "zipping datasets/SD for reuse ..."
+!cd /kaggle/working && tar -czf DUO-Anchor-datasets.tar.gz DUO-Anchor/datasets/SD/ 2>/dev/null
+!echo "Done: DUO-Anchor-datasets.tar.gz"
 
 
 # ============================================================
